@@ -1,0 +1,6 @@
+# src/config.py
+
+START_DATE = '1984-01-01'
+END_DATE = '2017-06-01'
+
+N_VARS_LASSO = 5
