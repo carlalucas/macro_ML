@@ -1239,67 +1239,107 @@ plt.close()
 print("  - Saved:", OUT_DIR / "Figure9_like_Top10_L2norms_vs_lambda.png")
 print("  - Saved:", OUT_DIR / "Figure9_top10_survivors.csv")
 
-#%%
-# ---- 10-fold time-series CV to select lambda ----
-print("[4.4/4] 10-fold time-series cross-validation to choose lambda...")
+# %% 5.2 (final) Cross-validation (k=5) to pick lambda_opt + plots
 
-# Compute CV curve
-cv_rows = []
-for lam in LAM_GRID_SCALED:
-    mse = cv_mse_for_lambda(Xmat, Ymat, groups, lam, n_splits=10)
-    cv_rows.append({"lambda": float(lam), "mse": mse})
+print("[4.4/4] Cross-validation to pick lambda_opt + plotting CV results...")
+# --- Lambda grid (ensure sorted for plotting)
+lam_grid = np.array(sorted([float(x) for x in LAM_GRID_SCALED]))  # ascending
 
-cv_df = pd.DataFrame(cv_rows).sort_values("lambda")
-cv_df.to_csv(OUT_DIR / "GroupLasso_CV_curve.csv", index=False)
+n_groups = int(groups.max()) + 1
+tscv = TimeSeriesSplit(n_splits=CV_SPLITS)
 
-best_row = cv_df.loc[cv_df["mse"].idxmin()]
-best_lam = float(best_row["lambda"])
+rmse_means = []
+rmse_stds  = []
 
-print(f"  - Best lambda (min CV MSE): {best_lam:.6f}")
-print("  - Saved CV curve:", OUT_DIR / "GroupLasso_CV_curve.csv")
+print(f"[CV] TimeSeriesSplit n_splits={CV_SPLITS}, lambdas={len(lam_grid)}")
+for lam in lam_grid:
+    group_reg = np.full(n_groups, float(lam))
+    group_reg[0] = 0.0  # IMPORTANT: const + y-lags unpenalized
 
-print("[4.5/4] Re-fitting Group-Lasso VAR at optimal lambda and saving coefficients...")
+    fold_rmses = []
+    for tr, te in tscv.split(Xmat):
+        gl = GroupLasso(
+            groups=groups,
+            group_reg=group_reg,
+            l1_reg=0.0,
+            n_iter=N_ITER_CV,
+            tol=TOL_CV,
+            supress_warning=True,
+            fit_intercept=False,
+            scale_reg="none",
+            warm_start=False,
+        )
+        gl.fit(Xmat[tr], Ymat[tr])
+        pred = gl.predict(Xmat[te])
 
-gl_best = GroupLasso(
-    groups=groups,
-    group_reg=best_lam,
-    l1_reg=0.0,
-    n_iter=N_ITER_CV,
-    tol=TOL_CV,
-    supress_warning=True,
-    fit_intercept=False,
-    scale_reg="none",
-)
-gl_best.fit(Xmat, Ymat)
-coef_best = gl_best.coef_.copy()
+        mse = np.mean((Ymat[te] - pred) ** 2)
+        fold_rmses.append(float(np.sqrt(mse)))
 
-# Save full coefficient table (all regressors)
-save_coef_tables(
-    coef=coef_best,
-    colmeta=colmeta,
-    y_vars=y_vars,
-    out_path=OUT_DIR / "GroupLasso_VAR_coefficients_best_lambda.csv",
-)
+    rmse_means.append(float(np.mean(fold_rmses)))
+    rmse_stds.append(float(np.std(fold_rmses, ddof=1)) if len(fold_rmses) > 1 else 0.0)
 
-# Also save reduced table: only x-vars in top10 (plus intercept + y-lags)
-keep_mask = (colmeta["block"] != "x") | (colmeta["var"].isin(top10))
-coef_best_reduced = coef_best[keep_mask.to_numpy(), :]
-colmeta_reduced = colmeta.loc[keep_mask].reset_index(drop=True)
+rmse_cv = pd.DataFrame(
+    {"lambda": lam_grid, "rmse_mean": rmse_means, "rmse_std": rmse_stds}
+).set_index("lambda")
 
-save_coef_tables(
-    coef=coef_best_reduced,
-    colmeta=colmeta_reduced,
-    y_vars=y_vars,
-    out_path=OUT_DIR / "GroupLasso_VAR_coefficients_best_lambda_reduced_top10.csv",
-)
+# Pick lambda that minimizes mean RMSE
+lam_opt = float(rmse_cv["rmse_mean"].idxmin())
+print(f"[CV] lambda_opt = {lam_opt:.6g} (min mean RMSE = {rmse_cv.loc[lam_opt, 'rmse_mean']:.6g})")
 
-# Save selected x-vars at best lambda (non-zero norms)
-norms_best = group_l2_norms_by_var(coef_best, colmeta, x_vars).sort_values(ascending=False)
-norms_best.to_csv(OUT_DIR / "GroupLasso_selected_norms_best_lambda.csv")
+# Save CV curve
+rmse_cv.to_csv(OUT_DIR / "Figure9_CV_RMSE_vs_lambda.csv")
+print("  - Saved:", OUT_DIR / "Figure9_CV_RMSE_vs_lambda.csv")
 
-print("  - Saved:", OUT_DIR / "GroupLasso_VAR_coefficients_best_lambda.csv")
-print("  - Saved:", OUT_DIR / "GroupLasso_VAR_coefficients_best_lambda_reduced_top10.csv")
-print("  - Saved:", OUT_DIR / "GroupLasso_selected_norms_best_lambda.csv")
+# -------------------------
+# Plot 1: RMSE vs lambda
+# -------------------------
+plt.figure(figsize=(8, 4))
+plt.plot(rmse_cv.index.values, rmse_cv["rmse_mean"].values, marker="o", linewidth=1)
+plt.axvline(lam_opt, linestyle="--", linewidth=1, label=f"λ* (CV) = {lam_opt:.4g}")
+# Optional: show previous lam_high if it exists
+if "lam_high" in globals():
+    plt.axvline(float(lam_high), linestyle=":", linewidth=1, label=f"λ_high = {float(lam_high):.4g}")
+
+plt.xscale("log")
+plt.xlabel("lambda (log scale)")
+plt.ylabel("RMSE (mean over folds)")
+plt.title("Cross-validation: RMSE vs lambda (Group-Lasso VAR)")
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "Figure9_CV_RMSE_vs_lambda.png", dpi=200)
+plt.close()
+print("  - Saved:", OUT_DIR / "Figure9_CV_RMSE_vs_lambda.png")
+
+# -------------------------------------------------------------------
+# Plot 2: Top-10 norms path, but vertical line at lambda_opt (CV)
+# -------------------------------------------------------------------
+# Ensure top10 exists; otherwise recompute from your previous rule using lam_high
+if "top10" not in globals() or top10 is None or len(top10) == 0:
+    if "norms_df" not in globals():
+        raise RuntimeError("norms_df not found. Run the lambda-path section first.")
+    if "lam_high" not in globals():
+        # fallback: pick the max lambda in grid
+        lam_high = float(norms_df.index.max())
+    top10 = norms_df.loc[lam_high].sort_values(ascending=False).head(10).index.tolist()
+
+plt.figure(figsize=(10, 5))
+for v in top10:
+    plt.plot(norms_df.index.values, norms_df[v].values, label=v)
+
+plt.xscale("log")
+plt.axvline(lam_opt, linestyle="--", linewidth=1, label=f"λ* (CV) = {lam_opt:.4g}")
+# Optional: keep lam_high marker too
+if "lam_high" in globals():
+    plt.axvline(float(lam_high), linestyle=":", linewidth=1, label=f"λ_high = {float(lam_high):.4g}")
+
+plt.xlabel("lambda (log scale)")
+plt.ylabel("L2 norm of coefficients (group norm)")
+plt.title("Top-10 selected topics: L2 norms vs lambda (marker at λ* from CV)")
+plt.legend(fontsize=8)
+plt.tight_layout()
+plt.savefig(OUT_DIR / "Figure9_Top10_L2norms_vs_lambda_lambda_opt.png", dpi=200)
+plt.close()
+print("  - Saved:", OUT_DIR / "Figure9_Top10_L2norms_vs_lambda_lambda_opt.png")
 
 
 # %%
