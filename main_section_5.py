@@ -77,13 +77,13 @@ FAST_MODE = True
 if FAST_MODE:
     LAM_GRID     = np.logspace(np.log10(1e-3), np.log10(2e-1), 25) #np.logspace(-3, -0.3, 20)   
     CV_SPLITS    = 3
-    N_ITER_PATH  = 800   #N_ITER_PATH = 2500  ou 1200                
+    N_ITER_PATH  = 1200   #N_ITER_PATH = 2500  ou 800                
     N_ITER_CV    = 800                      
-    TOL_PATH     = 1e-3  #TOL_PATH    = 1e-4                   
+    TOL_PATH     = 1e-4  #TOL_PATH    = 1e-3                   
     TOL_CV       = 1e-3
     LAM_GRID_RAW = None  # on la construira via lambda_max, donc ignore LAM_GRID initial
     EPS          = 1e-8
-    LAM_POINTS   = 16        # 20-25 is enough for Figure 9-like
+    LAM_POINTS   = 22        # 20-25 is enough for Figure 9-like
     LAM_RATIO    = 1e-3
 
 else:
@@ -1207,7 +1207,7 @@ for lam_raw in LAM_GRID_RAW:
         tol=TOL_PATH,
         supress_warning=True,
         fit_intercept=False,
-        scale_reg="group_size",
+        scale_reg="none",
         warm_start=True,   # enlève si ta version plante ici
     )
     gl.fit(Xmat, Ymat)
@@ -1253,9 +1253,9 @@ plt.figure(figsize=(10, 5))
 for v in top10:
     plt.plot(norms_df.index.values, norms_df[v].values, label=v)
 
-plt.xlim(1e-2, 1e-1)
-xticks = np.linspace(1e-2, 1e-1, 10)   # 0.01 -> 0.10
-plt.xticks(xticks, [f"{x:.2f}" for x in xticks])
+plt.xlim(5*1e-3, 5*1e-2)
+xticks = np.linspace(5*1e-3, 5*1e-2, 10)   # 0.01 -> 0.10
+plt.xticks(xticks, [f"{x:.3f}" for x in xticks])
 plt.axvline(lam_strong, linestyle="--", linewidth=1, label=f"strong λ={lam_strong:.4g}")
 plt.xlabel("lambda")
 plt.ylabel("L2 norm of coefficients (group norm)")
