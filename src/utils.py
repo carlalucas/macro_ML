@@ -13,40 +13,40 @@ def get_stars(p):
 
 def select_exact_k_lars(X, y, k=5):
     """
-    Sélectionne exactement k variables via l'algorithme LARS.
-    Entrée : DataFrame X, Series y
-    Sortie : Liste des indices (noms de colonnes) sélectionnés.
+    Selects k variables via LARS.
+    Assumes X and y are already standardized.
+    Returns the list of NAMES of the selected columns.
     """
-    # Standardisation critique pour le Lasso
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    X_s = scaler_X.fit_transform(X)
-    y_s = scaler_y.fit_transform(y.values.reshape(-1, 1)).flatten()
+    # Convert to numpy for scikit-learn
+    X_val = X.values if hasattr(X, 'values') else X
+    y_val = y.values if hasattr(y, 'values') else y.flatten()
+
+    # LARS algorithm
+    alphas, active, coefs = lars_path(X_val, y_val, method='lasso')
     
-    # Chemin de régularisation LARS
-    alphas, active, coefs = lars_path(X_s, y_s, method='lasso')
-    
-    # Trouver l'étape avec k variables actives
+    # Find the step with k non-zero variables
     n_active = np.count_nonzero(coefs, axis=0)
     
-    # On cherche l'index où n_active == k
+    # We look for the exact index, otherwise the closest
     step_idx = np.where(n_active == k)[0]
-    
     if len(step_idx) > 0:
         chosen_step = step_idx[0]
     else:
-        # Fallback : on prend le plus proche (rare)
         chosen_step = np.argmin(np.abs(n_active - k))
     
-    # Indices des variables non nulles à cette étape
+    # Indices of active variables
     active_indices = np.where(coefs[:, chosen_step] != 0)[0]
     
-    return X.columns[active_indices]
+    # Returns the NAMES of the columns if X is a DataFrame 
+    if hasattr(X, 'columns'):
+        return X.columns[active_indices].tolist()
+    
+    return active_indices
 
 def get_ar1_innovations(df):
     """
-    Calcule les résidus d'un processus AR(1) pour chaque colonne.
-    Utilisé pour stationnariser les séries (CFNAI, Volatilité).
+    Calculates the residuals of an AR(1) process for each column.
+    Used to stationarize the series (CFNAI, Volatility).
     """
     if df.empty: return pd.DataFrame()
     innovations = pd.DataFrame(index=df.index)
@@ -61,6 +61,6 @@ def get_ar1_innovations(df):
             model = sm.OLS(y, X).fit()
             innovations[col] = model.resid
         except:
-            pass # Skip si colinéarité
+            pass 
             
     return innovations.dropna()

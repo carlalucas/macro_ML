@@ -9,11 +9,11 @@ import os
 
 def load_topics(data_dir='data'):
     """
-    Charge Theta et Phi, et génère le mapping intelligent des noms.
+    Load Theta and Phi, and generate the intelligent mapping of names.
     """
     try:
         theta = pd.read_csv(f'{data_dir}/theta_monthly.csv', sep=None, engine='python')
-        # Détection date
+        # Date detection
         date_col = next((c for c in theta.columns if 'date' in str(c).lower()), theta.columns[0])
         theta[date_col] = pd.to_datetime(theta[date_col])
         theta.set_index(date_col, inplace=True)
@@ -22,11 +22,11 @@ def load_topics(data_dir='data'):
         
         phi = pd.read_csv(f'{data_dir}/phi_scaled.csv', sep=None, engine='python', index_col=0)
         
-        # --- MAPPING INTELLIGENT ---
+        # --- INTELLIGENT MAPPING ---
         labels_map = {}
         for i in range(min(theta.shape[1], phi.shape[1])):
             clean_name = phi.columns[i].strip()
-            # Sécurité si le nom est un chiffre
+            # Safety if the name is a number
             if str(clean_name).isdigit():
                  words = phi.iloc[:, i].sort_values(ascending=False).head(2).index.tolist()
                  clean_name = "-".join([str(w).lower() for w in words])
@@ -35,11 +35,11 @@ def load_topics(data_dir='data'):
         return theta, labels_map
         
     except Exception as e:
-        print(f"❌ Erreur chargement Topics: {e}")
+        print(f"Error loading Topics: {e}")
         return None, None
 
 def get_ken_french_49_daily():
-    """Télécharge les 49 Industries (Daily) depuis le site de Ken French."""
+    """Download the 49 Industries (Daily) from Ken French's site."""
     url = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/49_Industry_Portfolios_daily_CSV.zip"
     try:
         r = requests.get(url)
@@ -61,10 +61,10 @@ def get_ken_french_49_daily():
         df = df.dropna(subset=['Date'])
         df['Date'] = pd.to_datetime(df['Date'].astype(int).astype(str), format='%Y%m%d')
         df = df.set_index('Date')
-        df.columns = df.columns.str.strip() # Nettoyage essentiel
+        df.columns = df.columns.str.strip() # Essential cleaning
         return df.apply(pd.to_numeric, errors='coerce').dropna()
     except Exception as e:
-        print(f"❌ Erreur Ken French: {e}")
+        print(f"Ken French error: {e}")
         return None
 
 def transform_fred_md(df):
