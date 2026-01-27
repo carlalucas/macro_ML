@@ -25,7 +25,7 @@ from __future__ import annotations
 # import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -58,6 +58,7 @@ FRED_SERIES = {
     "PAYEMS": "PAYEMS",        # All Employees: Total Nonfarm Payrolls
     "FEDFUNDS": "FEDFUNDS",    # Effective Federal Funds Rate
     "VIXCLS": "VIXCLS",        # VIX (daily; optional robustness & 5.3)
+    "VXOCLS": "VXOCLS",        # VXO (daily; for backup when VIX missing, i.e. before 1990)
     "UMCSENT": "UMCSENT",      # Michigan consumer sentiment (monthly; optional robustness & 5.3)
 }
 # Note that SP500 is not available before 2016 on FRED-MD, so we download it separately.
@@ -74,7 +75,7 @@ np.random.seed(42)
 FAST_MODE = True
 
 if FAST_MODE:
-    LAM_GRID = np.logspace(-3, -1, 15)   
+    LAM_GRID = np.logspace(np.log10(1e-3), np.log10(2e-1), 25) #np.logspace(-3, -0.3, 20)   
     CV_SPLITS = 3
     N_ITER_PATH = 800                      
     N_ITER_CV   = 800                      
@@ -88,8 +89,13 @@ else:
     TOL_PATH    = 1e-5
     TOL_CV      = 1e-5
 
+VAR_GL_START = "1986-01-01"
 LAGS_GL = 3
 Y_VARS = ["SP500", "FEDFUNDS", "PAYEMS", "INDPRO"]
+
+
+# Plots parameters
+H = IRF_HORIZON
 
 #%%
 # -----------------------------
@@ -542,6 +548,209 @@ def cv_mse_for_lambda(X, Y, groups, lam, n_splits=10):
     return float(np.mean(mses))
 
 
+# -------------------------
+# Plotting
+# -------------------------
+
+def plot_irf_fig7(
+    results: Dict[str, IRFResult],
+    specs: Dict[str, dict],
+    out_dir: Path,
+    horizon: int,
+    response_vars: List[str] = ["INDPRO", "PAYEMS"],
+    response_titles: List[str] = ["Industrial Production", "Employment"],
+    panelA_key: str = "baseline",
+    panelB_main_key: str = "news_last",
+    panelB_overlay_keys: Optional[List[str]] = None,
+    fnameA: str = "Figure7_PanelA.png",
+    fnameB: str = "Figure7_PanelB.png",
+    suptitleA: str = "Panel A: Baseline VAR",
+    suptitleB: str = "Panel B: Robustness",
+):
+    """
+    Create and save Panel A and Panel B IRF plots.
+
+    Panel A:
+      - main spec = panelA_key
+      - line with round markers + 90% bands (alpha=0.2)
+
+    Panel B:
+      - main spec = panelB_main_key
+      - line with round markers + 90% bands OF panelB_main_key (NOT baseline)
+      - overlays = panelB_overlay_keys as dashed lines (median only)
+    """
+    if panelB_overlay_keys is None:
+        # default overlays = everything except the main key
+        panelB_overlay_keys = [k for k in specs.keys() if k != panelB_main_key]
+
+    H = horizon
+    h = np.arange(H + 1)
+
+    # Panel A
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+
+    resA = results[panelA_key]
+    ordA = specs[panelA_key]["ordering"]
+    shockA = specs[panelA_key]["shock"]
+
+    for ax, var, title in zip(axes, response_vars, response_titles):
+        med = get_median_path(resA, ordA, shockA, var)
+        lo, hi = get_band_paths(resA, ordA, var)
+
+        ax.plot(h, med, marker="o", markersize=3, linewidth=1)
+        ax.fill_between(h, lo, hi, alpha=0.2)
+        ax.axhline(0, linewidth=1)
+
+        ax.set_title(title)
+        ax.set_xlabel("Months")
+        ax.set_ylabel("%")
+
+    plt.suptitle(suptitleA)
+    plt.tight_layout()
+    plt.savefig(out_dir / fnameA, dpi=200)
+    plt.close(fig)
+
+    # Panel B
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+
+    # Main = news_last (bands + markers)
+    resB_main = results[panelB_main_key]
+    ordB_main = specs[panelB_main_key]["ordering"]
+    shockB_main = specs[panelB_main_key]["shock"]
+    main_label = specs[panelB_main_key].get("label", panelB_main_key)
+
+    for ax, var, title in zip(axes, response_vars, response_titles):
+        med_main = get_median_path(resB_main, ordB_main, shockB_main, var)
+        lo_main, hi_main = get_band_paths(resB_main, ordB_main, var)
+
+        ax.fill_between(h, lo_main, hi_main, alpha=0.15)
+        ax.plot(h, med_main, marker="o", markersize=3, linewidth=2, label=main_label)
+
+        # Overlays = dashed lines only
+        for k in panelB_overlay_keys:
+            if k == panelB_main_key:
+                continue
+            res_k = results[k]
+            ord_k = specs[k]["ordering"]
+            shock_k = specs[k]["shock"]
+            label_k = specs[k].get("label", k)
+
+            med_k = get_median_path(res_k, ord_k, shock_k, var)
+            ax.plot(h, med_k, linestyle="--", linewidth=1.5, label=label_k)
+
+        ax.axhline(0, linewidth=1)
+        ax.set_title(title)
+        ax.set_xlabel("Months")
+        ax.set_ylabel("%")
+        ax.legend(fontsize=8)
+
+    plt.suptitle(suptitleB)
+    plt.tight_layout()
+    plt.savefig(out_dir / fnameB, dpi=200)
+    plt.close(fig)
+
+def plot_irf_panel(
+    results: Dict[str, IRFResult],
+    specs: Dict[str, dict],
+    out_path: Path,
+    horizon: int,
+    resp_var: str,
+    subplots: List[Dict[str, Any]],
+    panel_title: Optional[str] = None,
+    figsize: Optional[tuple] = None,
+    sharey: bool = True,
+    xlabel: str = "Months",
+    ylabel: str = "%",
+    legend_fontsize: int = 9,
+    default_band_alpha: float = 0.20,
+):
+    """
+    Generic IRF panel plotter.
+
+    Parameters
+    ----------
+    results/specs:
+        - results[key] -> IRFResult
+        - specs[key]["ordering"], specs[key]["shock"], optional specs[key]["label"]
+    out_path:
+        where to save the figure (png, pdf, etc.)
+    horizon:
+        IRF horizon H (plots 0..H)
+    resp_var:
+        response variable name (must belong to each ordering used)
+    subplots:
+        list of subplot configs (one per axis). Example for 2 subplots:
+        [
+          {
+            "title": "Left title",
+            "series": [
+              {"key":"run_key_1", "label":"...", "linestyle":"-", "linewidth":2, "with_band":True, "marker":None},
+              {"key":"run_key_2", "label":"...", "linestyle":"--","linewidth":2, "with_band":True},
+            ]
+          },
+          {
+            "title": "Right title",
+            "series": [...]
+          }
+        ]
+    """
+    H = horizon
+    h = np.arange(H + 1)
+
+    ncols = len(subplots)
+    if figsize is None:
+        figsize = (6 * ncols, 4)
+
+    fig, axes = plt.subplots(1, ncols, figsize=figsize, sharex=True, sharey=sharey)
+    if ncols == 1:
+        axes = [axes]  # uniform handling
+
+    for ax, sp in zip(axes, subplots):
+        ax.set_title(sp.get("title", ""))
+
+        for s in sp.get("series", []):
+            key = s["key"]
+            res_k = results[key]
+            ord_k = specs[key]["ordering"]
+            shock_k = specs[key]["shock"]
+
+            label = s.get("label", specs[key].get("label", key))
+            linestyle = s.get("linestyle", "-")
+            linewidth = s.get("linewidth", 2)
+            marker = s.get("marker", None)
+
+            med = get_median_path(res_k, ord_k, shock_k, resp_var)
+            ax.plot(
+                h, med,
+                linestyle=linestyle,
+                linewidth=linewidth,
+                marker=marker,
+                label=label,
+            )
+
+            if s.get("with_band", False):
+                lo, hi = get_band_paths(res_k, ord_k, resp_var)
+                band_alpha = s.get("band_alpha", default_band_alpha)
+                ax.fill_between(h, lo, hi, alpha=band_alpha)
+
+        ax.axhline(0, linewidth=1)
+        ax.set_xlabel(xlabel)
+
+    # y-label only on left-most axis (cleaner, esp. sharey=True)
+    axes[0].set_ylabel(ylabel)
+
+    if panel_title:
+        plt.suptitle(panel_title)
+
+    # Legend: put on each axis by default (as in your current code)
+    for ax in axes:
+        ax.legend(fontsize=legend_fontsize)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close(fig)
+
+
 #%% 1. Load topic model outputs and download FRED series
 
 print("[1/4] Loading topics, and EPU, and downloading FRED series ...")
@@ -554,13 +763,10 @@ fred = {}
 fred["INDPRO"] = fred_download_csv(FRED_SERIES["INDPRO"], FRED_START, FRED_END)
 fred["PAYEMS"] = fred_download_csv(FRED_SERIES["PAYEMS"], FRED_START, FRED_END)
 fred["FEDFUNDS"] = fred_download_csv(FRED_SERIES["FEDFUNDS"], FRED_START, FRED_END)
-fred["UMCSENT"] = fred_download_csv(FRED_SERIES["UMCSENT"], FRED_START, FRED_END)
 
 # Daily -> monthly
 sp500_daily = stooq_download_spx_daily(FRED_START, FRED_END)
-vix_daily = fred_download_csv(FRED_SERIES["VIXCLS"], FRED_START, FRED_END)
 sp500_monthly = to_monthly(sp500_daily, how="last")
-fred["VIXCLS"] = to_monthly(vix_daily, how="last")
 
 # Combine core macro dataset
 df = pd.concat(
@@ -685,85 +891,25 @@ print("\n[Baseline peak responses to a 5th->95th percentile shock]")
 print(f"  INDPRO: {ip_min:.2f} at h={ip_h} months")
 print(f"  PAYEMS: {emp_min:.2f} at h={emp_h} months")
 
-# Plots
-
-H = IRF_HORIZON
-h = np.arange(H + 1)
-
-# ---- Panel A: baseline only, with 5/95 band ----
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
-
-for ax, var, title in zip(
-    axes,
-    ["INDPRO", "PAYEMS"],
-    ["Industrial Production", "Employment"],
-):
-    base_res = results["baseline"]
-    base_order = specs["baseline"]["ordering"]
-    base_shock = specs["baseline"]["shock"]
-
-    med = get_median_path(base_res, base_order, base_shock, var)
-    lo, hi = get_band_paths(base_res, base_order, var)
-
-    ax.plot(h, med, marker="o", markersize=3, linewidth=1)
-    ax.fill_between(h, lo, hi, alpha=0.2)
-    ax.axhline(0, linewidth=1)
-
-    ax.set_title(title)
-    ax.set_xlabel("Months")
-    ax.set_ylabel("%")
-
-plt.suptitle("Panel A: Baseline VAR")
-plt.tight_layout()
-plt.savefig(OUT_DIR / "Figure7_PanelA.png", dpi=200)
-plt.close(fig)
-
-# ---- Panel B: baseline band + median lines for robustness checks ----
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
-
-robust_keys = ["baseline", "epu_instead", "news_second", "news_last", "incl_epu"]
-robust_labels = {k: specs[k]["label"] for k in robust_keys}
-
-for ax, var, title in zip(
-    axes,
-    ["INDPRO", "PAYEMS"],
-    ["Industrial Production", "Employment"],
-):
-    # baseline band + baseline line
-    base_res = results["baseline"]
-    base_order = specs["baseline"]["ordering"]
-    base_shock = specs["baseline"]["shock"]
-
-    med_base = get_median_path(base_res, base_order, base_shock, var)
-    lo, hi = get_band_paths(base_res, base_order, var)
-
-    ax.fill_between(h, lo, hi, alpha=0.15)
-    ax.plot(h, med_base, linewidth=2, label="Baseline")
-
-    # other robustness: median lines only
-    for k in robust_keys[1:]:
-        res_k = results[k]
-        ord_k = specs[k]["ordering"]
-        shock_k = specs[k]["shock"]
-
-        med_k = get_median_path(res_k, ord_k, shock_k, var)
-
-        # style: dashed for robustness
-        ax.plot(h, med_k, linestyle="--", linewidth=1.5, label=robust_labels[k])
-
-    ax.axhline(0, linewidth=1)
-    ax.set_title(title)
-    ax.set_xlabel("Months")
-    ax.set_ylabel("%")
-    ax.legend(fontsize=8)
-
-plt.suptitle("Panel B: Robustness")
-plt.tight_layout()
-plt.savefig(OUT_DIR / "Figure7_PanelB.png", dpi=200)
-plt.close(fig)
+# Plot equivalent of Fig 7 (Panel A (Baseline VAR) + Panel B (Robustness checks))
+plot_irf_fig7(
+    results=results,
+    specs=specs,
+    out_dir=OUT_DIR,
+    horizon=IRF_HORIZON,
+    response_vars=["INDPRO", "PAYEMS"],
+    response_titles=["Industrial Production", "Employment"],
+    panelA_key="baseline",
+    panelB_main_key="news_last",
+    panelB_overlay_keys=["baseline", "epu_instead", "news_second", "incl_epu"],
+    fnameA="Figure7_PanelA.png",
+    fnameB="Figure7_PanelB.png",
+    suptitleA="Panel A: Baseline VAR",
+    suptitleB="Panel B: Robustness (News Last bands)",
+)
 
 
-#%% 3. News vs SP500 shocks and News vs EPU shocks (Figure 8)
+#%% 3. News vs SP500 shocks and News vs EPU shocks 
 
 print("[3/4] Estimating VAR(3) and IRFs for (News vs SP500 shocks) and (News vs EPU shocks) ...")
 
@@ -871,201 +1017,84 @@ print(f"  PAYEMS: {emp_min:.2f} at h={emp_h} months")
 
 
 # Plots
-H = IRF_HORIZON
-h = np.arange(H + 1)
 
-# ---- Panel A: INDPRO response ----
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True, sharey=True)
+# Panel A: INDPRO
+plot_irf_panel(
+    results=results_figure8,
+    specs=specs_figure8,
+    out_path=OUT_DIR / "Figure8_PanelA_INDPRO.png",
+    horizon=IRF_HORIZON,
+    resp_var="INDPRO",
+    subplots=[
+        {
+            "title": "Panel A: INDPRO — News first",
+            "series": [
+                {"key": "news_first__shock_news",  "label": "Recession attention shock", "linestyle": "-",  "linewidth": 2, "with_band": True},
+                {"key": "news_first__shock_sp500", "label": "SP500 shock",              "linestyle": "--", "linewidth": 2, "with_band": True},
+            ],
+        },
+        {
+            "title": "Panel A: INDPRO — SP500 first",
+            "series": [
+                {"key": "sp_first__shock_news",  "label": "Recession attention shock", "linestyle": "-",  "linewidth": 2, "with_band": True},
+                {"key": "sp_first__shock_sp500", "label": "SP500 shock",              "linestyle": "--", "linewidth": 2, "with_band": True},
+            ],
+        },
+    ],
+    sharey=True,
+)
 
-# Left: News first
-ax = axes[0]
-resp_var = "INDPRO"
+# Panel B: PAYEMS
+plot_irf_panel(
+    results=results_figure8,
+    specs=specs_figure8,
+    out_path=OUT_DIR / "Figure8_PanelB_PAYEMS.png",
+    horizon=IRF_HORIZON,
+    resp_var="PAYEMS",
+    subplots=[
+        {
+            "title": "Panel B: PAYEMS — News first",
+            "series": [
+                {"key": "news_first__shock_news",  "label": "Recession attention shock", "linestyle": "-",  "linewidth": 2, "with_band": True},
+                {"key": "news_first__shock_sp500", "label": "SP500 shock",              "linestyle": "--", "linewidth": 2, "with_band": True},
+            ],
+        },
+        {
+            "title": "Panel B: PAYEMS — SP500 first",
+            "series": [
+                {"key": "sp_first__shock_news",  "label": "Recession attention shock", "linestyle": "-",  "linewidth": 2, "with_band": True},
+                {"key": "sp_first__shock_sp500", "label": "SP500 shock",              "linestyle": "--", "linewidth": 2, "with_band": True},
+            ],
+        },
+    ],
+    sharey=True,
+)
 
-# News shock (solid) + band
-k = "news_first__shock_news"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linewidth=2, label="Recession attention shock")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-# SP500 shock (dashed) + band
-k = "news_first__shock_sp500"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linestyle="--", linewidth=2, label="SP500 shock")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-ax.axhline(0, linewidth=1)
-ax.set_title("Panel A: INDPRO — News first")
-ax.set_xlabel("Months")
-ax.set_ylabel("%")
-ax.legend(fontsize=9)
-
-# Right: SP500 first
-ax = axes[1]
-
-# News shock (solid) + band
-k = "sp_first__shock_news"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linewidth=2, label="Recession attention shock")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-# SP500 shock (dashed) + band
-k = "sp_first__shock_sp500"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linestyle="--", linewidth=2, label="SP500 shock")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-ax.axhline(0, linewidth=1)
-ax.set_title("Panel A: INDPRO — SP500 first")
-ax.set_xlabel("Months")
-ax.legend(fontsize=9)
-
-plt.tight_layout()
-plt.savefig(OUT_DIR / "Figure8_PanelA_INDPRO.png", dpi=200)
-plt.close(fig)
-
-# ---- Panel B: PAYEMS response ----
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True, sharey=True)
-
-resp_var = "PAYEMS"
-
-# Left: News first
-ax = axes[0]
-
-k = "news_first__shock_news"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linewidth=2, label="Recession attention shock")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-k = "news_first__shock_sp500"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linestyle="--", linewidth=2, label="SP500 shock")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-ax.axhline(0, linewidth=1)
-ax.set_title("Panel B: PAYEMS — News first")
-ax.set_xlabel("Months")
-ax.set_ylabel("%")
-ax.legend(fontsize=9)
-
-# Right: SP500 first
-ax = axes[1]
-
-k = "sp_first__shock_news"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linewidth=2, label="Recession attention shock")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-k = "sp_first__shock_sp500"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linestyle="--", linewidth=2, label="SP500 shock")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-ax.axhline(0, linewidth=1)
-ax.set_title("Panel B: PAYEMS — SP500 first")
-ax.set_xlabel("Months")
-ax.legend(fontsize=9)
-
-plt.tight_layout()
-plt.savefig(OUT_DIR / "Figure8_PanelB_PAYEMS.png", dpi=200)
-plt.close(fig)
-
-# ---- Panel C: SP500 response (paper-style stock response panel) ----
-fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True, sharey=True)
-
-resp_var = "SP500"
-
-# Left subplot: SP500 response to NEWS shock, news first vs news second
-ax = axes[0]
-
-# news first (solid)
-k = "news_first__shock_news"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linewidth=2, label="News shock (news 1st)")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-# news second (dashed) = SP500 first ordering, still shock is recession_attn
-k = "sp_first__shock_news"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linestyle="--", linewidth=2, label="News shock (news 2nd)")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-ax.axhline(0, linewidth=1)
-ax.set_title("Panel C: SP500 response — News shock")
-ax.set_xlabel("Months")
-ax.set_ylabel("%")
-ax.legend(fontsize=9)
-
-# Right subplot: SP500 response to EPU shock, EPU first vs EPU second
-ax = axes[1]
-
-# EPU first (solid)
-k = "epu_first__shock_epu"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linewidth=2, label="EPU shock (EPU 1st)")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-# EPU second (dashed)
-k = "epu_second__shock_epu"
-res_k = results_figure8[k]
-ord_k = specs_figure8[k]["ordering"]
-shock_k = specs_figure8[k]["shock"]
-med = get_median_path(res_k, ord_k, shock_k, resp_var)
-lo, hi = get_band_paths(res_k, ord_k, resp_var)
-ax.plot(h, med, linestyle="--", linewidth=2, label="EPU shock (EPU 2nd)")
-ax.fill_between(h, lo, hi, alpha=0.20)
-
-ax.axhline(0, linewidth=1)
-ax.set_title("Panel C: SP500 response — EPU shock (BBD VAR)")
-ax.set_xlabel("Months")
-ax.legend(fontsize=9)
-
-plt.tight_layout()
-plt.savefig(OUT_DIR / "Figure8_PanelC_SP500Response_News_vs_EPU.png", dpi=200)
-plt.close(fig)
+# Panel C: SP500 response (News shock vs EPU shock)
+plot_irf_panel(
+    results=results_figure8,
+    specs=specs_figure8,
+    out_path=OUT_DIR / "Figure8_PanelC_SP500Response_News_vs_EPU.png",
+    horizon=IRF_HORIZON,
+    resp_var="SP500",
+    subplots=[
+        {
+            "title": "Panel C: SP500 response — News shock",
+            "series": [
+                {"key": "news_first__shock_news", "label": "News shock (news 1st)", "linestyle": "-",  "linewidth": 2, "with_band": True},
+                {"key": "sp_first__shock_news",   "label": "News shock (news 2nd)", "linestyle": "--", "linewidth": 2, "with_band": True},
+            ],
+        },
+        {
+            "title": "Panel C: SP500 response — EPU shock (BBD VAR)",
+            "series": [
+                {"key": "epu_first__shock_epu",  "label": "EPU shock (EPU 1st)", "linestyle": "-",  "linewidth": 2, "with_band": True},
+                {"key": "epu_second__shock_epu", "label": "EPU shock (EPU 2nd)", "linestyle": "--", "linewidth": 2, "with_band": True},
+            ],
+        },
+    ],
+    sharey=True,
+)
 
 # %% 4. Group Lasso VAR selection
 
@@ -1081,15 +1110,22 @@ x_topics.index = x_topics.index.to_period("M").to_timestamp(how="start")
 # EPU already in df_all
 x_epu = df_all[["EPU"]].copy()
 
-# # VIX: si tu l’as dans fred (daily) -> passer mensuel (month-end recommandé)
-# # Adapte cette partie si tu as déjà une série VIX mensuelle dans df_all
-# vix_daily = fred["VIXCLS"]["VIXCLS"].copy()
-# vix_monthly = vix_daily.resample("M").last()
-# vix_monthly.index = vix_monthly.index.to_period("M").to_timestamp(how="start")
-# x_vix = vix_monthly.to_frame("VIX")
+# VIX completed by VXO 
+vix_daily = fred_download_csv(FRED_SERIES["VIXCLS"], FRED_START, FRED_END)
+vix_monthly = to_monthly(vix_daily, how="last").rename(columns={"VIXCLS":"VIX"})
+vxo_daily = fred_download_csv(FRED_SERIES["VXOCLS"], FRED_START, FRED_END)
+vxo_monthly = to_monthly(vxo_daily, how="last").rename(columns={"VXOCLS":"VIX"})
+cut = vix_monthly.index.min()
+x_vix = pd.concat([vxo_monthly.loc[vxo_monthly.index < cut], vix_monthly])
+
+# Michigan Consumer Sentiment (UMCSENT)
+fred["UMCSENT"] = fred_download_csv(FRED_SERIES["UMCSENT"], FRED_START, FRED_END)
+x_umcsent = fred["UMCSENT"][["UMCSENT"]].copy()
+x_umcsent.index = x_umcsent.index.to_period("M").to_timestamp(how="start")
+x_umcsent = x_umcsent.rename(columns={"UMCSENT":"UMCSENT"})
 
 # Assemble x_t
-x_all = pd.concat([x_topics, x_epu], axis=1)
+x_all = pd.concat([x_topics, x_epu, x_vix, x_umcsent], axis=1)
 
 # Assemble y_t
 y_all = df_all[Y_VARS].copy()
