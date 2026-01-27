@@ -75,19 +75,25 @@ np.random.seed(42)
 FAST_MODE = True
 
 if FAST_MODE:
-    LAM_GRID = np.logspace(np.log10(1e-3), np.log10(2e-1), 25) #np.logspace(-3, -0.3, 20)   
-    CV_SPLITS = 3
-    N_ITER_PATH = 800                      
-    N_ITER_CV   = 800                      
-    TOL_PATH    = 1e-3                     
-    TOL_CV      = 1e-3
+    LAM_GRID     = np.logspace(np.log10(1e-3), np.log10(2e-1), 25) #np.logspace(-3, -0.3, 20)   
+    CV_SPLITS    = 3
+    N_ITER_PATH  = 800   #N_ITER_PATH = 2500  ou 1200                
+    N_ITER_CV    = 800                      
+    TOL_PATH     = 1e-3  #TOL_PATH    = 1e-4                   
+    TOL_CV       = 1e-3
+    LAM_GRID_RAW = None  # on la construira via lambda_max, donc ignore LAM_GRID initial
+    EPS          = 1e-8
+    LAM_POINTS   = 16        # 20-25 is enough for Figure 9-like
+    LAM_RATIO    = 1e-3
+
 else:
-    LAM_GRID = np.logspace(-3, -0.3, 40) 
-    CV_SPLITS = 10
+    LAM_GRID    = np.logspace(-3, -0.3, 40) 
+    CV_SPLITS   = 10
     N_ITER_PATH = 5000
     N_ITER_CV   = 4000
     TOL_PATH    = 1e-5
     TOL_CV      = 1e-5
+    EPS         = 1e-12
 
 VAR_GL_START = "1986-01-01"
 LAGS_GL = 3
@@ -1125,19 +1131,12 @@ x_umcsent.index = x_umcsent.index.to_period("M").to_timestamp(how="start")
 x_umcsent = x_umcsent.rename(columns={"UMCSENT":"UMCSENT"})
 
 # Assemble x_t
-x_all = pd.concat([x_topics, x_epu, x_vix, x_umcsent], axis=1)
+x_all = pd.concat([x_topics, x_epu, x_vix, x_umcsent], axis=1).dropna()
 
 # Assemble y_t
-y_all = df_all[Y_VARS].copy()
+y_all = df_all[Y_VARS].loc[VAR_GL_START:].copy()
 
-# Align & drop NA
-y_all = y_all.loc[VAR_START:]
-x_all = x_all.loc[VAR_START:]
-
-idx = y_all.index.intersection(x_all.index)
-y_all = y_all.loc[idx]
-x_all = x_all.loc[idx]
-
+# Align samples: keep only dates with full data in both y and x
 df_joint = pd.concat([y_all, x_all], axis=1).dropna()
 y_all = df_joint[Y_VARS]
 x_all = df_joint[x_all.columns]
@@ -1148,51 +1147,76 @@ x_std = variance_standardize(x_all)
 
 Xmat, Ymat, groups, colmeta = build_group_lasso_var_design(y=y_std, x=x_std, lags=LAGS_GL)
 
+def lambda_max_group_lasso_raw(X, Y, groups):
+    """
+    Calcule un lambda_max (échelle 'raw') tel qu'au-dessus,
+    tous les groupes pénalisés (g>=1) deviennent (quasi) nuls.
+    On partial-out d'abord les colonnes non pénalisées (group 0).
+    """
+    Z = X[:, groups == 0]                # const + y-lags (non pénalisés)
+    Bz = np.linalg.lstsq(Z, Y, rcond=None)[0]
+    R = Y - Z @ Bz                       # résidus à expliquer par X pénalisé
+
+    lam_max = 0.0
+    for g in np.unique(groups):
+        if g == 0:
+            continue
+        cols = np.where(groups == g)[0]
+        score = np.linalg.norm(X[:, cols].T @ R, ord="fro")  # raw (pas /n)
+        lam_max = max(lam_max, float(score))
+    return lam_max
+
+n = Xmat.shape[0]
+lam_max_raw = lambda_max_group_lasso_raw(Xmat, Ymat, groups)
+
+LAM_GRID_RAW = np.geomspace(lam_max_raw, lam_max_raw * LAM_RATIO, LAM_POINTS)
+
+print(f"lambda_max_raw={lam_max_raw:.4g}, n={n}, lambda_max_scaled={lam_max_raw/n:.4g}")
+
+
 x_vars = list(x_std.columns)  # 180 topics + EPU + VIX
 y_vars = list(y_std.columns)
 
-print(f"  - Samples: {Xmat.shape[0]}")
-print(f"  - Regressors: {Xmat.shape[1]}")
+print(f"  - Lags (L): {LAGS_GL}")
+print(f"  - Samples (T-L): {Xmat.shape[0]}")
 print(f"  - Equations (K: #y variables): {Ymat.shape[1]}")
-print(f"  - #x variables (topic+EPU(+VIX+UMCSENT)): {len(x_vars)}")
-
-# Sanity checks
-K = y_std.shape[1]
-M = x_std.shape[1]
-L = LAGS_GL
-print("K=", K, "M=", M, "L=", L, "theoretical regressors =", 1 + L*(K+M))
-
-print("df_joint first date:", df_joint.index[0])
-print("df_joint last date :", df_joint.index[-1])
-print("T (rows)           :", len(df_joint))
-print("lags               :", L)
-print("expected samples   :", len(df_joint) - L)
+print(f"  - Topics, EPU, VIX, UMCSENT (M: #x variables): {len(x_vars)}")
+print(f"  - Regressors (1 + L*(K+M)): {Xmat.shape[1]}")
 
 
 # ---- Fit Group Lasso path and compute group norms ----
 print("[4.2/4] Fitting lambda path and computing group norms (Figure 9 data)...")
 
-coef_path = {}          # lambda -> coef matrix (P,K)
-norms_path = []         # rows = lambda, cols = x_vars
+coef_path = {}
+norms_path = []
 
-for lam in LAM_GRID:
+n_groups = int(groups.max()) + 1
+n = Xmat.shape[0]
+
+for lam_raw in LAM_GRID_RAW:
+    lam_scaled = lam_raw #lam_raw / n   # pour l'axe x comparable au papier
+
+    group_reg = np.full(n_groups, float(lam_raw), dtype=float)
+    group_reg[0] = 0.0  # const + y-lags non pénalisés
+
     gl = GroupLasso(
         groups=groups,
-        group_reg=float(lam),
+        group_reg=group_reg,
         l1_reg=0.0,
         n_iter=N_ITER_PATH,
         tol=TOL_PATH,
         supress_warning=True,
-        fit_intercept=False,   # we already included 'const'
-        scale_reg="none",
+        fit_intercept=False,
+        scale_reg="group_size",
+        warm_start=True,   # enlève si ta version plante ici
     )
     gl.fit(Xmat, Ymat)
 
-    coef = gl.coef_.copy()  # (P, K)
-    coef_path[float(lam)] = coef
+    coef = gl.coef_.copy()
+    coef_path[float(lam_scaled)] = coef
 
     norms = group_l2_norms_by_var(coef, colmeta, x_vars)
-    norms.name = float(lam)
+    norms.name = float(lam_scaled)
     norms_path.append(norms)
 
 norms_df = pd.DataFrame(norms_path)
@@ -1205,10 +1229,7 @@ print("  - Saved norms path:", OUT_DIR / "Figure9_norms_path_all_predictors.csv"
 
 
 # ---- Select top-10 survivors at high penalty (lambda max) and plot Figure 9 ----
-print("[4.3/4] Selecting top-10 survivors at high penalty (lambda max) and plotting Figure 9...")
-
-# numerical threshold for "active" variable
-EPS = 1e-12  
+print("[4.3/4] Selecting top-10 survivors at high penalty (lambda max) and plotting Figure 9...") 
 
 # active variables count per lambda
 active_counts = (norms_df > EPS).sum(axis=1)
@@ -1232,9 +1253,11 @@ plt.figure(figsize=(10, 5))
 for v in top10:
     plt.plot(norms_df.index.values, norms_df[v].values, label=v)
 
-plt.xscale("log")
+plt.xlim(1e-2, 1e-1)
+xticks = np.linspace(1e-2, 1e-1, 10)   # 0.01 -> 0.10
+plt.xticks(xticks, [f"{x:.2f}" for x in xticks])
 plt.axvline(lam_strong, linestyle="--", linewidth=1, label=f"strong λ={lam_strong:.4g}")
-plt.xlabel("lambda (log scale)")
+plt.xlabel("lambda")
 plt.ylabel("L2 norm of coefficients (group norm)")
 plt.title("Figure 9-like: Group-Lasso VAR selection path (top 10 survivors at strong penalty)")
 plt.legend(fontsize=8)
@@ -1245,7 +1268,7 @@ plt.close()
 print("  - Saved:", OUT_DIR / "Figure9_like_Top10_L2norms_vs_lambda.png")
 print("  - Saved:", OUT_DIR / "Figure9_top10_survivors.csv")
 
-
+#%%
 # ---- 10-fold time-series CV to select lambda ----
 print("[4.4/4] 10-fold time-series cross-validation to choose lambda...")
 
@@ -1306,6 +1329,3 @@ norms_best.to_csv(OUT_DIR / "GroupLasso_selected_norms_best_lambda.csv")
 print("  - Saved:", OUT_DIR / "GroupLasso_VAR_coefficients_best_lambda.csv")
 print("  - Saved:", OUT_DIR / "GroupLasso_VAR_coefficients_best_lambda_reduced_top10.csv")
 print("  - Saved:", OUT_DIR / "GroupLasso_selected_norms_best_lambda.csv")
-
-
-# %%
