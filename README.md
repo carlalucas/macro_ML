@@ -1,30 +1,24 @@
-# Replication: Bybee et al. (2021) - Section 4.1
+## 1. Sparse Topic Regression & Macroeconomic Forecasting (`1_sparse_topic_regression.ipynb`)
 
-This project replicates the specific methodology and results from **Section 4.1: Selection Via Lasso Regression** of the paper *"Business News and Business Cycles"* by Bybee, Kelly, Manela, and Xiu (2021).
+This notebook evaluates the predictive power of business news narratives on inflation.
 
-The goal is to demonstrate that news attention (extracted from WSJ articles) corresponds closely with key macroeconomic indicators (Industrial Production, Employment, Market Returns, and Volatility).
+### Overview
+We map high-dimensional textual data (180 news topics derived from the WSJ) to inflation using sparse modeling techniques.
 
-## Key Features
+### Methodology
+* **Variable Selection:** Fixed-cardinality **LARS (Least Angle Regression)** selecting exactly $k=5$ topics per target to ensure parsimony and interpretability.
+* **Estimation:** Post-Selection OLS inference.
+* **Evaluation:** Recursive **expanding window** forecasting (Out-of-sample $R^2$ vs. Historical mean).
 
-* **Exact-5 Variable Selection (LARS):** Unlike standard Lasso which selects variables based on a penalty parameter $\lambda$, this script uses **Least Angle Regression (LARS)** to select **exactly 5 active topics** for each regression model. This strictly adheres to the paper's requirement for interpretability and comparability.
-* **Expanding Window Forecast (OOS):** Implements a recursive out-of-sample (OOS) forecasting loop. At each time step $t$, the model re-selects the top 5 topics based *only* on past data (up to $t$) to predict $t+1$. This rigorous approach avoids look-ahead bias.
-* **Post-Selection Inference:** Calculates coefficients and p-values using an OLS regression on the selected active set (Post-Lasso OLS), providing standard errors adjusted for model selection.
-* **Dual-Track Analysis:**
-    * **In-Sample Analysis:** Fits the model on the full dataset to demonstrate explanatory power and identify historical narrative drivers.
-    * **Out-of-Sample Analysis:** Measures the true predictive power ($R^2_{OOS}$) simulating a real-time forecaster.
-* **Visualization:** Generates dual-line plots comparing "In-Sample Fit" (blue), "Out-of-Sample Forecast" (red), and actual economic data (black).
+### 📊 Key Analysis Sections
+1.  **Macroeconomic Forecasting:** Predicting Real Activity (Industrial Production, Employment).
+2.  **🚀 Extension - Inflation Dynamics:** Investigating the link between news narratives and US Inflation (CPI & PCE), testing the Phillips curve mechanism via text.
+3.  **Asset Pricing:** Explaining aggregate Stock Market Returns and Volatility (VIX).
+4.  **Sectoral Risk:** Modeling idiosyncratic volatility across 49 Industries (Ken French dataset).
+5.  **Validation:** Benchmarking statistical topics against Economic Policy Uncertainty (EPU) indices.
 
-## Outputs
-
-For each target variable (Industrial Production Growth, Employment Growth, Market Returns, Market Volatility), the script outputs:
-
-1.  **Regression Table:** A formatted table listing the top 5 news topics, their standardized coefficients ($\beta$), and p-values.
-2.  **Performance Metrics:**
-    * **In-Sample $R^2$:** How well news explains past variations.
-    * **Out-of-Sample $R^2$:** How well news predicts future variations compared to a historical mean benchmark.
-3.  **Time-Series Plot:** A visual comparison showing the divergence between the model's ex-post explanation (In-Sample) and ex-ante prediction (Out-of-Sample).
-
-## Dependencies
-
-Install the required packages using:
-pip install pandas numpy matplotlib scikit-learn statsmodels pandas-datareader scipy
+### 📦 Data Sources
+* **Text:** Topic concentrations $\theta_t$ (Bybee et al.).
+* **Macro:** FRED (St. Louis Fed), FRED-MD.
+* **Finance:** Kenneth French Data Library (Industry Portfolios).
+* **Policy:** Baker, Bloom & Davis (EPU Indices).
