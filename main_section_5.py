@@ -1,10 +1,8 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Reproduce sections 5.0–5.4 of "Business News and Business Cycles" using:
-- theta_monthly.csv (monthly topic attention, 1984–2017)
-- phi_scaled.csv    (scaled word weights by topic)
-- (optional) EPU csv you download from authors' site
+- theta_monthly.csv (monthly topic attention, 1984–2017, downloaded from the autors' site: https://structureofnews.com) 
+- phi_scaled.csv    (scaled word weights by topic, downloaded from the autors' site: https://structureofnews.com)
+- US_Policy_Uncertainty_Data.xlsx (downloaded from authors' site : https://www.policyuncertainty.com/us_monthly.html)
 
 What this script does (5.0–5.4):
 5.0  Build the "recession attention" series from theta_monthly (auto-detect topic via phi_scaled)
@@ -14,10 +12,12 @@ What this script does (5.0–5.4):
      Compare with EPU shock (replace recession series with EPU)
 5.3  Group-lasso selection among 180 topics + (EPU,VIX,UMCSENT) to predict core macro variables
      following the paper’s idea: select variables as groups across lags
-5.4  Prints interpretation hooks (selected topic, effect sizes); narrative discussion is not computational.
-
-No pandas-datareader used. FRED download is automated via fredgraph.csv (no API key).
+5.4  Prints interpretation hooks (selected topic, effect sizes).
 """
+#%% 
+# -----------------------------
+# Imports
+# -----------------------------
 
 from __future__ import annotations
 
@@ -30,6 +30,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import requests
+import io
+import matplotlib.pyplot as plt
 import statsmodels.api as sm
 from statsmodels.tsa.api import VAR
 
@@ -39,11 +41,8 @@ from statsmodels.tsa.api import VAR
 
 DATA_DIR = Path("data")
 THETA_FILE = DATA_DIR / "theta_monthly.csv"
-PHI_FILE = DATA_DIR / "phi_scaled.csv"
-
-# Optional: your EPU csv you download from authors' site (set to None if not used)
-# (Expected: a date column + a value column, see load_epu() below.)
-EPU_FILE = DATA_DIR / "epu_monthly.csv"  # change if needed; or set to None
+RECESSION_COLNAME = "Recession"
+EPU_XLSX_FILE = DATA_DIR / "US_Policy_Uncertainty_Data.xlsx"
 
 OUT_DIR = Path("outputs_section5")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -56,21 +55,10 @@ FRED_SERIES = {
     "INDPRO": "INDPRO",        # Industrial Production Index
     "PAYEMS": "PAYEMS",        # All Employees: Total Nonfarm Payrolls
     "FEDFUNDS": "FEDFUNDS",    # Effective Federal Funds Rate
-    "SP500": "SP500",          # S&P 500 (daily; will be converted to monthly)
     "VIXCLS": "VIXCLS",        # VIX (daily; optional robustness & 5.3)
     "UMCSENT": "UMCSENT",      # Michigan consumer sentiment (monthly; optional robustness & 5.3)
 }
-
-# Heuristic to identify the "recession" topic from phi_scaled
-RECESSION_KEYWORDS = {
-    "recession", "downturn", "slowdown", "slump", "contraction", "jobless",
-    "unemployment", "layoffs", "bankrupt", "bankruptcy", "foreclosure",
-    "weak", "decline", "falling", "drop", "credit", "crisis"
-}
-
-# If you already KNOW the recession topic id/column, set it here to bypass auto-detection.
-# Examples: "topic_37" or "37" or whatever your theta columns look like.
-RECESSION_TOPIC_OVERRIDE: Optional[str] = None
+# Note that SP500 is not available before 2016 on FRED-MD, so we download it separately.
 
 # VAR params
 LAGS = 3
@@ -79,9 +67,8 @@ BOOT_REPS = 500  # increase (e.g. 1000–2000) for paper-like smooth bands (slow
 
 np.random.seed(42)
 
-
 # -----------------------------
-# Utilities
+# Utilities & loading / downloading data
 # -----------------------------
 
 def fred_download_csv(series_id: str, start: str, end: str) -> pd.DataFrame:
@@ -100,6 +87,31 @@ def fred_download_csv(series_id: str, start: str, end: str) -> pd.DataFrame:
     df[series_id] = pd.to_numeric(df[series_id], errors="coerce")
     return df
 
+
+def stooq_download_spx_daily(start: str, end: str) -> pd.DataFrame:
+    """
+    Download S&P 500 index from Stooq as daily OHLCV.
+    Symbol: ^SPX
+    Returns DataFrame indexed by date with column 'SP500' (Close).
+    Source: https://stooq.com/q/d/?s=%5Espx  (CSV download available)  :contentReference[oaicite:2]{index=2}
+    """
+    url = "https://stooq.com/q/d/l/"
+    params = {"s": "^spx", "i": "d"}  # daily
+    r = requests.get(url, params=params, timeout=60)
+    r.raise_for_status()
+
+    df = pd.read_csv(io.StringIO(r.text))
+    # Stooq columns typically: Date, Open, High, Low, Close, Volume
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.set_index("Date").sort_index()
+
+    # Keep Close as SP500 level
+    df = df.rename(columns={"Close": "SP500"})[["SP500"]]
+    df["SP500"] = pd.to_numeric(df["SP500"], errors="coerce")
+
+    # Filter sample
+    df = df.loc[pd.to_datetime(start):pd.to_datetime(end)]
+    return df
 
 def to_monthly(df: pd.DataFrame, how: str = "mean") -> pd.DataFrame:
     """
@@ -122,156 +134,66 @@ def zscore(s: pd.Series) -> pd.Series:
     return (s - s.mean()) / s.std(ddof=0)
 
 
-# -----------------------------
-# Load topic model outputs
-# -----------------------------
-
 def load_theta(path: Path) -> pd.DataFrame:
     """
-    Load theta_monthly.csv: monthly topic attention. Tries to infer date column.
-    Expected: one date-like column and many topic columns (180).
+    Load theta_monthly.csv: monthly topic attention. 
+    Transform date column to datetime index.
+    Checked: start of the month index.
     """
     df = pd.read_csv(path)
-    # Find a date column
-    date_col = None
-    for c in df.columns:
-        if c.lower() in {"date", "dt", "month", "time"}:
-            date_col = c
-            break
-    if date_col is None:
-        # try first column
-        date_col = df.columns[0]
-
+    date_col = "date"
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.set_index(date_col).sort_index()
-    # Ensure monthly start frequency
-    df.index = df.index.to_period("M").to_timestamp("MS")
+    # Ensure month-start index
+    df.index = df.index.to_period("M").to_timestamp(how="start")
     return df
 
 
-def load_phi(path: Path) -> pd.DataFrame:
+def load_epu_xlsx(path: Path) -> pd.Series:
     """
-    Load phi_scaled.csv: scaled word weights by topic.
-    Handles two common formats:
-      (A) columns: ["topic", "word", "phi_scaled"] (long)
-      (B) wide: index=word, columns=topic ids
-    Returns a tidy long DataFrame with columns: topic, word, weight
+    Load monthly US EPU from the Excel file (sheet: 'Main News Index') where:
+      col1 = year
+      col2 = month (1-12)
+      col3 = EPU index
+    Builds a month-start DatetimeIndex (YYYY-MM-01) and returns a Series named 'EPU'.
     """
-    df = pd.read_csv(path)
+    df = pd.read_excel(path, sheet_name="Main News Index", engine="openpyxl")
 
-    cols_lower = {c.lower() for c in df.columns}
-    if {"topic", "word"}.issubset(cols_lower):
-        # long format
-        topic_col = [c for c in df.columns if c.lower() == "topic"][0]
-        word_col = [c for c in df.columns if c.lower() == "word"][0]
-        # weight col guess
-        weight_col = None
-        for c in df.columns:
-            if c.lower() in {"phi_scaled", "weight", "phi", "phi_tilde", "score", "value"}:
-                weight_col = c
-                break
-        if weight_col is None:
-            # last column as fallback
-            weight_col = df.columns[-1]
+    # Take first 3 columns robustly (year, month, EPU)
+    df = df.iloc[:, :3].copy()
+    df.columns = ["year", "month", "EPU"]
 
-        out = df[[topic_col, word_col, weight_col]].copy()
-        out.columns = ["topic", "word", "weight"]
-        out["topic"] = out["topic"].astype(str)
-        out["word"] = out["word"].astype(str)
-        out["weight"] = pd.to_numeric(out["weight"], errors="coerce")
-        return out.dropna(subset=["weight"])
+    # Coerce types
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df["month"] = pd.to_numeric(df["month"], errors="coerce")
+    df["EPU"] = pd.to_numeric(df["EPU"], errors="coerce")
 
-    # wide format fallback: first col words, rest topics
-    word_col = df.columns[0]
-    out = df.melt(id_vars=[word_col], var_name="topic", value_name="weight")
-    out = out.rename(columns={word_col: "word"})
-    out["topic"] = out["topic"].astype(str)
-    out["word"] = out["word"].astype(str)
-    out["weight"] = pd.to_numeric(out["weight"], errors="coerce")
-    return out.dropna(subset=["weight"])
+    # Drop invalid rows
+    df = df.dropna(subset=["year", "month", "EPU"])
+    df = df[(df["month"] >= 1) & (df["month"] <= 12)]
 
-
-def top_words_by_topic(phi_long: pd.DataFrame, topn: int = 30) -> Dict[str, List[str]]:
-    """
-    Returns dict: topic -> list of topn words by weight (descending)
-    """
-    d: Dict[str, List[str]] = {}
-    for t, g in phi_long.groupby("topic"):
-        g2 = g.sort_values("weight", ascending=False).head(topn)
-        d[t] = g2["word"].str.lower().tolist()
-    return d
-
-
-def detect_recession_topic(phi_long: pd.DataFrame) -> str:
-    """
-    Heuristic: choose topic with max keyword matches in its top words,
-    breaking ties by total matched weights.
-    """
-    topw = top_words_by_topic(phi_long, topn=50)
-
-    # Precompute weights map for tie-breaker
-    phi_long["word_l"] = phi_long["word"].str.lower()
-    weights = (
-        phi_long[phi_long["word_l"].isin(RECESSION_KEYWORDS)]
-        .groupby("topic")["weight"]
-        .sum()
-        .to_dict()
+    # Build month-start dates
+    df["date"] = pd.to_datetime(
+        dict(year=df["year"].astype(int), month=df["month"].astype(int), day=1),
+        errors="coerce",
     )
+    df = df.dropna(subset=["date"]).set_index("date").sort_index()
 
-    best_topic = None
-    best_score = (-1, -np.inf)
+    # Ensure month-start index
+    df.index = df.index.to_period("M").to_timestamp(how="start")
 
-    for t, words in topw.items():
-        hits = sum(1 for w in words if w in RECESSION_KEYWORDS)
-        wsum = weights.get(t, 0.0)
-        score = (hits, wsum)
-        if score > best_score:
-            best_score = score
-            best_topic = t
+    return df["EPU"].rename("EPU")
 
-    if best_topic is None:
-        raise RuntimeError("Could not detect recession topic from phi_scaled.csv.")
+def get_median_path(res_obj, ordering, shock_var, response_var):
+    shock_idx = ordering.index(shock_var)
+    resp_idx = ordering.index(response_var)
+    return res_obj.irf_scaled[:, resp_idx, shock_idx]
 
-    return str(best_topic)
-
-
-# -----------------------------
-# Load EPU (optional)
-# -----------------------------
-
-def load_epu(path: Path) -> pd.Series:
-    """
-    Load an EPU csv you downloaded from authors' site.
-    Flexible parsing:
-      - finds a date-like column and a numeric value column
-    Returns monthly-start indexed Series named "EPU".
-    """
-    df = pd.read_csv(path)
-    # date col
-    date_col = None
-    for c in df.columns:
-        if c.lower() in {"date", "dt", "month", "time"}:
-            date_col = c
-            break
-    if date_col is None:
-        date_col = df.columns[0]
-
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.set_index(date_col).sort_index()
-    df.index = df.index.to_period("M").to_timestamp("MS")
-
-    # value col: first numeric column
-    val_col = None
-    for c in df.columns:
-        if pd.api.types.is_numeric_dtype(df[c]) or pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.9:
-            val_col = c
-            break
-    if val_col is None:
-        val_col = df.columns[-1]
-
-    s = pd.to_numeric(df[val_col], errors="coerce").rename("EPU")
-    return s
-
+def get_band_paths(res_obj, ordering, response_var):
+    resp_idx = ordering.index(response_var)
+    lo = res_obj.lower[:, resp_idx]
+    hi = res_obj.upper[:, resp_idx]
+    return lo, hi
 
 # -----------------------------
 # VAR + Bootstrap IRFs
@@ -298,22 +220,31 @@ def orth_irf(res: sm.tsa.vector_ar.var_model.VARResults, horizon: int) -> np.nda
     return irf_obj.orth_irfs  # (h+1, K, K)
 
 
-def scale_to_percentile_shock(
-    irf_orth: np.ndarray,
-    df: pd.DataFrame,
-    shock_var: str,
+def scale_to_percentile_structural_shock(
+    res,
     shock_idx: int,
     p_low: float = 5,
     p_high: float = 95,
 ) -> float:
     """
-    Scale factor so that impact on shock_var at h=0 equals (p_high - p_low) in units of the variable.
+    Compute shock scale as (p95 - p05) of the orthogonalized (structural) shock ε_t.
+
+    statsmodels orth_irfs are responses to a 1-unit ε shock.
+    Therefore the scaling factor is simply the desired ε amplitude.
     """
-    desired = np.nanpercentile(df[shock_var], p_high) - np.nanpercentile(df[shock_var], p_low)
-    impact = irf_orth[0, shock_idx, shock_idx]  # response of shock_var to its own orth shock at h=0
-    if impact == 0 or np.isnan(impact):
-        raise RuntimeError("Zero/NaN impact in IRF scaling.")
-    return desired / impact
+    # Reduced-form residuals u_t (T-lags, K)
+    u = res.resid.values
+
+    # Cholesky factor P such that Sigma_u = P P'
+    P = np.linalg.cholesky(res.sigma_u.values)
+
+    # Structural shocks: eps = P^{-1} u
+    eps = np.linalg.solve(P, u.T).T  # (T-lags, K)
+
+    shock_eps = eps[:, shock_idx]
+    desired = np.nanpercentile(shock_eps, p_high) - np.nanpercentile(shock_eps, p_low)
+    return float(desired)
+
 
 
 def residual_bootstrap_irf_bands(
@@ -373,7 +304,7 @@ def residual_bootstrap_irf_bands(
             res_b = fit_var(df_b, lags)
             irf_b = orth_irf(res_b, horizon)
             # scale to 5–95 shock for each bootstrap draw
-            sf = scale_to_percentile_shock(irf_b, df_b, shock_var, shock_idx)
+            sf = scale_to_percentile_structural_shock(res_b, shock_idx)
             # store responses of all variables to shock_var shock (diagonal shock)
             irf_paths[b] = (irf_b[:, :, shock_idx] * sf)
         except Exception:
@@ -397,7 +328,7 @@ def run_var_irf(
     res = fit_var(df, lags)
     irf_o = orth_irf(res, horizon)
     shock_idx = ordering.index(shock_var)
-    sf = scale_to_percentile_shock(irf_o, df, shock_var, shock_idx)
+    sf = scale_to_percentile_structural_shock(res, shock_idx)
 
     lower, upper = residual_bootstrap_irf_bands(
         df=df, ordering=ordering, lags=lags, horizon=horizon,
@@ -547,7 +478,231 @@ def group_lasso_cv_select(
 
     return float(best_lam), selected
 
+#%% 1. Load topic model outputs and download FRED series
 
+print("[1/6] Loading topics, and EPU, and downloading FRED series ...")
+theta = load_theta(THETA_FILE)
+recession_attention = theta[RECESSION_COLNAME].rename("recession_attn")
+
+print("[1/6]bis Downloading FRED series ...")
+fred = {}
+# Monthly series
+fred["INDPRO"] = fred_download_csv(FRED_SERIES["INDPRO"], FRED_START, FRED_END)
+fred["PAYEMS"] = fred_download_csv(FRED_SERIES["PAYEMS"], FRED_START, FRED_END)
+fred["FEDFUNDS"] = fred_download_csv(FRED_SERIES["FEDFUNDS"], FRED_START, FRED_END)
+fred["UMCSENT"] = fred_download_csv(FRED_SERIES["UMCSENT"], FRED_START, FRED_END)
+
+# Daily -> monthly
+sp500_daily = stooq_download_spx_daily(FRED_START, FRED_END)
+vix_daily = fred_download_csv(FRED_SERIES["VIXCLS"], FRED_START, FRED_END)
+sp500_monthly = to_monthly(sp500_daily, how="mean")
+fred["VIXCLS"] = to_monthly(vix_daily, how="mean")
+
+# Combine core macro dataset
+df = pd.concat(
+    [
+        recession_attention,
+        sp500_monthly["SP500"],
+        fred["FEDFUNDS"]["FEDFUNDS"],
+        fred["PAYEMS"]["PAYEMS"],
+        fred["INDPRO"]["INDPRO"],
+    ],
+    axis=1,
+).loc[FRED_START:FRED_END]
+
+# Transformations: 100*log for levels; rates in levels; attention in percent
+df["recession_attn"] = 100.0 * df["recession_attn"]
+df["SP500"] = 100.0 * safe_log(df["SP500"])
+df["PAYEMS"] = 100.0 * safe_log(df["PAYEMS"])
+df["INDPRO"] = 100.0 * safe_log(df["INDPRO"])
+# FEDFUNDS stays as percent rate (already)
+df = df.dropna()
+
+print("[1/6]ter Loading EPU series ...")
+# Load EPU (monthly) from Excel and align to df sample
+epu = load_epu_xlsx(EPU_XLSX_FILE).loc[df.index.min():df.index.max()]
+# Aligne index exactly on the same dates
+epu = epu.reindex(df.index)
+
+
+# Combine for full df
+df_all = pd.concat([df, epu], axis=1).dropna()
+
+
+#%% 2. Estimate VAR(3) and IRFs
+
+print("[2/6] Estimating VAR(3) and IRFs (baseline + robustness orderings + EPU checks)...")
+
+# --- Define specifications for each case ---
+specs = {
+    # Panel A baseline
+    "baseline": {
+        "df": df_all,
+        "ordering": ["recession_attn", "SP500", "FEDFUNDS", "PAYEMS", "INDPRO"],
+        "shock": "recession_attn",
+        "label": "Baseline",
+    },
+
+    # Panel B robustness (ordering tests)
+    "news_last": {
+        "df": df_all,
+        "ordering": ["SP500", "FEDFUNDS", "PAYEMS", "INDPRO", "recession_attn"],
+        "shock": "recession_attn",
+        "label": "News Last",
+    },
+    "news_second": {
+        "df": df_all,
+        "ordering": ["SP500", "recession_attn", "FEDFUNDS", "PAYEMS", "INDPRO"],
+        "shock": "recession_attn",
+        "label": "News 2nd",
+    },
+
+    # Panel B robustness: EPU instead of recession_attn (shock becomes EPU)
+    "epu_instead": {
+        "df": df_all,
+        "ordering": ["EPU", "SP500", "FEDFUNDS", "PAYEMS", "INDPRO"],
+        "shock": "EPU",
+        "label": "EPU",
+    },
+
+    # Panel B robustness: include EPU as control (shock stays recession_attn)
+    # NB: l’ordre exact est un choix d’identification. Ici on met EPU après SP500.
+    "incl_epu": {
+        "df": df_all,
+        "ordering": ["SP500", "EPU", "recession_attn", "FEDFUNDS", "PAYEMS", "INDPRO"],
+        "shock": "recession_attn",
+        "label": "Incl. EPU",
+    },
+}
+
+results = {}
+
+for key, s in specs.items():
+    order = s["ordering"]
+    shock_var = s["shock"]
+    df_use = s["df"][order].dropna()
+
+    print(f"  - {key}: shock={shock_var} ordering={order}")
+    r = run_var_irf(
+        df_use,
+        ordering=order,
+        shock_var=shock_var,
+        lags=LAGS,
+        horizon=IRF_HORIZON,
+        reps=BOOT_REPS,
+    )
+    results[key] = r
+
+    # Save IRFs to disk (responses to the specified shock)
+    shock_idx = order.index(shock_var)
+    irf_resp = pd.DataFrame(
+        r.irf_scaled[:, :, shock_idx],
+        columns=order,
+        index=pd.Index(range(IRF_HORIZON + 1), name="h"),
+    )
+    irf_resp.to_csv(OUT_DIR / f"irf_{key}_responses_to_{shock_var}_shock.csv")
+
+    bands_lo = pd.DataFrame(r.lower, columns=order, index=irf_resp.index)
+    bands_hi = pd.DataFrame(r.upper, columns=order, index=irf_resp.index)
+    bands_lo.to_csv(OUT_DIR / f"irf_{key}_lower90.csv")
+    bands_hi.to_csv(OUT_DIR / f"irf_{key}_upper90.csv")
+
+# Peak effects for baseline (like paper discussion)
+def peak_drop(series: pd.Series) -> Tuple[float, int]:
+    v = series.values
+    h = int(np.nanargmin(v))
+    return float(v[h]), h
+
+base = results["baseline"]
+base_order = specs["baseline"]["ordering"]
+base_shock = specs["baseline"]["shock"]
+base_shock_idx = base_order.index(base_shock)
+base_resp = pd.DataFrame(base.irf_scaled[:, :, base_shock_idx], columns=base_order)
+
+ip_min, ip_h = peak_drop(base_resp["INDPRO"])
+emp_min, emp_h = peak_drop(base_resp["PAYEMS"])
+print("\n[Baseline peak responses to a 5th->95th percentile shock]")
+print(f"  INDPRO: {ip_min:.2f} at h={ip_h} months")
+print(f"  PAYEMS: {emp_min:.2f} at h={emp_h} months")
+
+# Plots
+
+H = IRF_HORIZON
+h = np.arange(H + 1)
+
+# ---- Panel A: baseline only, with 5/95 band ----
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+
+for ax, var, title in zip(
+    axes,
+    ["INDPRO", "PAYEMS"],
+    ["Industrial Production", "Employment"],
+):
+    base_res = results["baseline"]
+    base_order = specs["baseline"]["ordering"]
+    base_shock = specs["baseline"]["shock"]
+
+    med = get_median_path(base_res, base_order, base_shock, var)
+    lo, hi = get_band_paths(base_res, base_order, var)
+
+    ax.plot(h, med, marker="o", markersize=3, linewidth=1)
+    ax.fill_between(h, lo, hi, alpha=0.2)
+    ax.axhline(0, linewidth=1)
+
+    ax.set_title(title)
+    ax.set_xlabel("Months")
+    ax.set_ylabel("%")
+
+plt.suptitle("Panel A: Baseline VAR")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "Figure7_PanelA.png", dpi=200)
+plt.close(fig)
+
+# ---- Panel B: baseline band + median lines for robustness checks ----
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharex=True)
+
+robust_keys = ["baseline", "epu_instead", "news_second", "news_last", "incl_epu"]
+robust_labels = {k: specs[k]["label"] for k in robust_keys}
+
+for ax, var, title in zip(
+    axes,
+    ["INDPRO", "PAYEMS"],
+    ["Industrial Production", "Employment"],
+):
+    # baseline band + baseline line
+    base_res = results["baseline"]
+    base_order = specs["baseline"]["ordering"]
+    base_shock = specs["baseline"]["shock"]
+
+    med_base = get_median_path(base_res, base_order, base_shock, var)
+    lo, hi = get_band_paths(base_res, base_order, var)
+
+    ax.fill_between(h, lo, hi, alpha=0.15)
+    ax.plot(h, med_base, linewidth=2, label="Baseline")
+
+    # other robustness: median lines only
+    for k in robust_keys[1:]:
+        res_k = results[k]
+        ord_k = specs[k]["ordering"]
+        shock_k = specs[k]["shock"]
+
+        med_k = get_median_path(res_k, ord_k, shock_k, var)
+
+        # style: dashed for robustness
+        ax.plot(h, med_k, linestyle="--", linewidth=1.5, label=robust_labels[k])
+
+    ax.axhline(0, linewidth=1)
+    ax.set_title(title)
+    ax.set_xlabel("Months")
+    ax.set_ylabel("%")
+    ax.legend(fontsize=8)
+
+plt.suptitle("Panel B: Robustness")
+plt.tight_layout()
+plt.savefig(OUT_DIR / "Figure7_PanelB.png", dpi=200)
+plt.close(fig)
+
+#%%
 # -----------------------------
 # Main workflow
 # -----------------------------
@@ -558,48 +713,21 @@ def main() -> int:
     if not THETA_FILE.exists():
         print(f"[ERROR] Missing {THETA_FILE}.", file=sys.stderr)
         return 1
-    if not PHI_FILE.exists():
-        print(f"[ERROR] Missing {PHI_FILE}.", file=sys.stderr)
+    
+    if not EPU_XLSX_FILE.exists():
+        print(f"[ERROR] Missing {EPU_XLSX_FILE}.", file=sys.stderr)
         return 1
+    
+
+    ############################################################
+    # --- Load topic model, EPU, Download FRED series ---
+    ############################################################
 
     print("[1/6] Loading topic model outputs...")
     theta = load_theta(THETA_FILE)
-    phi_long = load_phi(PHI_FILE)
+    recession_attention = theta[RECESSION_COLNAME].rename("recession_attn")
 
-    if RECESSION_TOPIC_OVERRIDE is not None:
-        recession_topic = str(RECESSION_TOPIC_OVERRIDE)
-        print(f"  Using RECESSION_TOPIC_OVERRIDE={recession_topic}")
-    else:
-        recession_topic = detect_recession_topic(phi_long)
-        print(f"  Auto-detected recession topic: {recession_topic}")
-
-    # Map recession topic to a theta column (handle common naming mismatches)
-    theta_cols = list(map(str, theta.columns))
-    if recession_topic in theta_cols:
-        recession_col = recession_topic
-    else:
-        # try common patterns
-        candidates = [
-            f"topic_{recession_topic}",
-            f"Topic_{recession_topic}",
-            f"t{recession_topic}",
-            recession_topic.zfill(3),
-        ]
-        match = next((c for c in candidates if c in theta_cols), None)
-        if match is None:
-            # last resort: try numeric match
-            numeric = "".join(ch for ch in recession_topic if ch.isdigit())
-            match = next((c for c in theta_cols if "".join(ch for ch in c if ch.isdigit()) == numeric), None)
-        if match is None:
-            print("[ERROR] Could not match recession topic to a theta column.", file=sys.stderr)
-            print("  Detected topic:", recession_topic, file=sys.stderr)
-            print("  Theta columns sample:", theta_cols[:10], "...", file=sys.stderr)
-            return 1
-        recession_col = match
-
-    recession_attention = theta[recession_col].rename("recession_attn")
-
-    print("[2/6] Downloading FRED series (no pandas-datareader)...")
+    print("[1/6] Downloading FRED series ...")
     fred = {}
     # Monthly series
     fred["INDPRO"] = fred_download_csv(FRED_SERIES["INDPRO"], FRED_START, FRED_END)
@@ -608,16 +736,16 @@ def main() -> int:
     fred["UMCSENT"] = fred_download_csv(FRED_SERIES["UMCSENT"], FRED_START, FRED_END)
 
     # Daily -> monthly
-    sp500_daily = fred_download_csv(FRED_SERIES["SP500"], FRED_START, FRED_END)
+    sp500_daily = stooq_download_spx_daily(FRED_START, FRED_END)
     vix_daily = fred_download_csv(FRED_SERIES["VIXCLS"], FRED_START, FRED_END)
-    fred["SP500"] = to_monthly(sp500_daily, how="mean")
+    sp500_monthly = to_monthly(sp500_daily, how="mean")
     fred["VIXCLS"] = to_monthly(vix_daily, how="mean")
 
     # Combine core macro dataset
     df = pd.concat(
         [
             recession_attention,
-            fred["SP500"]["SP500"],
+            sp500_monthly["SP500"],
             fred["FEDFUNDS"]["FEDFUNDS"],
             fred["PAYEMS"]["PAYEMS"],
             fred["INDPRO"]["INDPRO"],
@@ -632,6 +760,13 @@ def main() -> int:
     df["INDPRO"] = 100.0 * safe_log(df["INDPRO"])
     # FEDFUNDS stays as percent rate (already)
     df = df.dropna()
+
+    # Load EPU (monthly) from Excel and align to df sample
+    epu = load_epu_xlsx(EPU_XLSX_FILE).loc[df.index.min():df.index.max()]
+
+    ############################################################
+    # --- VAR estimation and IRFs ---
+    ############################################################
 
     print("[3/6] Estimating VAR(3) and IRFs (baseline + robustness orderings)...")
     # Baseline ordering (paper baseline places "recession" early; we’ll do it first)
@@ -684,33 +819,44 @@ def main() -> int:
     print(f"  PAYEMS: {emp_min:.2f} at h={emp_h} months")
     print(f"  SP500 : {sp_min:.2f} at h={sp_h} months")
 
-    print("\n[4/6] Optional comparison: replace recession with EPU (BBD-style comparison)...")
-    if EPU_FILE is not None and Path(EPU_FILE).exists():
-        epu = load_epu(Path(EPU_FILE)).loc[df.index.min():df.index.max()]
-        # Align & transform (typical: log or level; we keep level and zscore for comparability)
-        # If your EPU is already an index, you can keep in levels. Here: z-score helps scale.
-        epu = zscore(epu).rename("EPU")
-        df_epu = df.copy()
-        df_epu = df_epu.drop(columns=["recession_attn"])
+
+    ############################################################
+    # --- EPU VAR ---
+    ############################################################
+
+    print("\n[4/6] Comparison: replace recession with EPU (BBD-style comparison)...")
+    # --- EPU benchmark VAR (like BBD comparison in the paper) ---
+    if epu is not None and epu.notna().any():
+        df_epu = df.drop(columns=["recession_attn"]).copy()
         df_epu = pd.concat([epu, df_epu], axis=1).dropna()
 
+        # Option 1 (proche du papier) : choc 5e->95e en niveau d'EPU (pas de zscore)
         epu_order = ["EPU", "SP500", "FEDFUNDS", "PAYEMS", "INDPRO"]
-        print(f"  - EPU VAR ordering={epu_order}")
-        r_epu = run_var_irf(df_epu, ordering=epu_order, shock_var="EPU", lags=LAGS, horizon=IRF_HORIZON, reps=BOOT_REPS)
-
-        shock_idx2 = epu_order.index("EPU")
-        irf_resp_epu = pd.DataFrame(r_epu.irf_scaled[:, :, shock_idx2], columns=epu_order)
+        r_epu = run_var_irf(
+            df_epu,
+            ordering=epu_order,
+        shock_var="EPU",
+            lags=LAGS,
+            horizon=IRF_HORIZON,
+            reps=BOOT_REPS
+        )
+        # Sauvegarde des IRFs et bandes
+        shock_idx = epu_order.index("EPU")
+        irf_resp_epu = pd.DataFrame(
+            r_epu.irf_scaled[:, :, shock_idx],
+            columns=epu_order,
+            index=pd.Index(range(IRF_HORIZON + 1), name="h"),
+        )
         irf_resp_epu.to_csv(OUT_DIR / "irf_epu_responses_to_epu_shock.csv")
-        pd.DataFrame(r_epu.lower, columns=epu_order).to_csv(OUT_DIR / "irf_epu_lower90.csv")
-        pd.DataFrame(r_epu.upper, columns=epu_order).to_csv(OUT_DIR / "irf_epu_upper90.csv")
-
-        ip_min2, ip_h2 = peak_drop(irf_resp_epu["INDPRO"])
-        emp_min2, emp_h2 = peak_drop(irf_resp_epu["PAYEMS"])
-        print("  [EPU peak responses to 5–95 shock (z-scored EPU; interpret magnitudes cautiously)]")
-        print(f"    INDPRO: {ip_min2:.2f} at h={ip_h2}")
-        print(f"    PAYEMS: {emp_min2:.2f} at h={emp_h2}")
+        pd.DataFrame(r_epu.lower, columns=epu_order, index=irf_resp_epu.index).to_csv(OUT_DIR / "irf_epu_lower90.csv")
+        pd.DataFrame(r_epu.upper, columns=epu_order, index=irf_resp_epu.index).to_csv(OUT_DIR / "irf_epu_upper90.csv")
     else:
-        print("  (Skipped: EPU_FILE not found. Put your downloaded EPU csv in data/ and set EPU_FILE.)")
+        print("[WARN] EPU series is missing or empty; skipping EPU VAR.")
+
+
+    ############################################################
+    # --- Group-lasso selection among topics + EPU/VIX/UMCSENT ---
+    ############################################################
 
     print("\n[5/6] Group-lasso selection among topics + EPU/VIX/UMCSENT (section 5.3 idea)...")
     # Core macro variables y_t (paper uses a core set; here we use SP500, FEDFUNDS, PAYEMS, INDPRO)
@@ -734,12 +880,12 @@ def main() -> int:
 
     x_all = pd.concat([x_topics, x_other], axis=1)
 
-    # Add EPU if present
-    if EPU_FILE is not None and Path(EPU_FILE).exists():
-        epu = load_epu(Path(EPU_FILE))
-        epu = epu.rename("EPU")
-        epu.index = epu.index.to_period("M").to_timestamp("MS")
-        x_all = pd.concat([x_all, epu], axis=1)
+    # # Add EPU if present
+    # if EPU_FILE is not None and Path(EPU_FILE).exists():
+    #     epu = load_epu(Path(EPU_FILE))
+    #     epu = epu.rename("EPU")
+    #     epu.index = epu.index.to_period("M").to_timestamp("MS")
+    #     x_all = pd.concat([x_all, epu], axis=1)
 
     # Restrict to sample
     x_all = x_all.loc[y_core.index.min():y_core.index.max()]
@@ -779,7 +925,7 @@ def main() -> int:
     print("\n[6/6] Done. Outputs saved in:", OUT_DIR.resolve())
     print("Key files:")
     print("  - irf_*_responses_to_recession_shock.csv (+ lower/upper 90% bands)")
-    print("  - (optional) irf_epu_responses_to_epu_shock.csv")
+    print("  - irf_epu_responses_to_epu_shock.csv")
     print("  - group_lasso_selected_candidates.csv")
 
     return 0
@@ -787,3 +933,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# %%
