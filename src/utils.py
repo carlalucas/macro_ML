@@ -42,25 +42,3 @@ def select_exact_k_lars(X, y, k=5):
         return X.columns[active_indices].tolist()
     
     return active_indices
-
-def get_ar1_innovations(df):
-    """
-    Calculates the residuals of an AR(1) process for each column.
-    Used to stationarize the series (CFNAI, Volatility).
-    """
-    if df.empty: return pd.DataFrame()
-    innovations = pd.DataFrame(index=df.index)
-    for col in df.columns:
-        series = df[col].dropna()
-        if len(series) < 24: continue
-        
-        y = series.iloc[1:]
-        X = sm.add_constant(series.shift(1).iloc[1:])
-        
-        try:
-            model = sm.OLS(y, X).fit()
-            innovations[col] = model.resid
-        except:
-            pass 
-            
-    return innovations.dropna()
