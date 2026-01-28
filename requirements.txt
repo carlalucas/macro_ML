@@ -3,6 +3,7 @@ numpy
 matplotlib
 scikit-learn
 statsmodels
-pandas-datareader
 scipy
 openpyxl
+warnings
+group_lasso

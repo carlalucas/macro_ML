@@ -1,9 +1,6 @@
 # src/utils.py
 import numpy as np
-import pandas as pd
-import statsmodels.api as sm
 from sklearn.linear_model import lars_path
-from sklearn.preprocessing import StandardScaler
 
 def get_stars(p):
     if p < 0.01: return "***"
