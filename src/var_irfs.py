@@ -272,6 +272,7 @@ def plot_irf_fig7(
     plt.suptitle(suptitleA)
     plt.tight_layout()
     plt.savefig(out_dir / fnameA, dpi=200)
+    plt.show()
     plt.close(fig)
 
     # Panel B
@@ -311,6 +312,7 @@ def plot_irf_fig7(
     plt.suptitle(suptitleB)
     plt.tight_layout()
     plt.savefig(out_dir / fnameB, dpi=200)
+    plt.show()
     plt.close(fig)
 
 def plot_irf_panel(
@@ -412,4 +414,5 @@ def plot_irf_panel(
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
+    plt.show()
     plt.close(fig)
